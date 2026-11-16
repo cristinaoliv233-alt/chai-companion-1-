@@ -1,0 +1,78 @@
+/**
+ * Motor de conversa (apenas servidor). Usado pelo site e, no futuro, pelo Raspberry Pi.
+ * Fluxo: carrega contexto → guarda mensagem → deteta "lembra-te que..." → responde em streaming → guarda resposta.
+ */
+import Anthropic from "@anthropic-ai/sdk";
+import { read, write, newId } from "./store.js";
+import { buildSystemPrompt } from "./personality.js";
+import { detectRememberIntent } from "./memory-intent.js";
+
+const MODEL = process.env.CHAT_MODEL || "claude-sonnet-4-6";
+const HISTORY_WINDOW = 20;
+const MAX_MEMORIES_IN_PROMPT = 60;
+const client = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+
+/** Transforma "o meu gato chama-se Pixel" em { label, content } (com fallback simples). */
+async function extractMemory(fact, userName) {
+  try {
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 200,
+      system: 'Responde APENAS com JSON {"label":"...","content":"..."}. label: título de 1 a 3 palavras (ex.: Nome, Projeto atual, Interesses, Gato). content: o facto conciso em português de Portugal, sem repetir o título.',
+      messages: [{ role: "user", content: `Utilizador: ${userName || "desconhecido"}\nFacto: ${fact}` }],
+    });
+    const text = res.content.map((c) => c.text ?? "").join("").replace(/```json|```/g, "").trim();
+    const p = JSON.parse(text);
+    if (typeof p.label === "string" && typeof p.content === "string" && p.content.trim()) {
+      return { label: p.label.trim().slice(0, 60), content: p.content.trim().slice(0, 500) };
+    }
+  } catch (err) {
+    console.error("[chai] extração de memória falhou:", err.message);
+  }
+  return { label: "Nota", content: fact.slice(0, 500) };
+}
+
+export function describeError(err) {
+  console.error("[chai] erro:", err?.status ?? "", err?.message ?? err);
+  if (err?.code === "NO_KEY") return "Falta a ANTHROPIC_API_KEY no ficheiro .env do servidor.";
+  if (err?.status === 429) return "Estou a receber demasiados pedidos. Tenta daqui a pouco.";
+  if (err?.status === 401) return "A chave da API não é válida. Verifica o ficheiro .env.";
+  return "Não consegui pensar numa resposta agora. Tenta outra vez.";
+}
+
+/** Gerador de eventos: { type: "memory" | "delta" | "done" }. */
+export async function* runChat(message, signal) {
+  if (!client) throw Object.assign(new Error("sem chave"), { code: "NO_KEY" });
+  const { profile, memories, messages } = read();
+  const history = messages.slice(-HISTORY_WINDOW).map((m) => ({ role: m.role, content: m.content }));
+  while (history.length && history[0].role !== "user") history.shift(); // a API exige começar por "user"
+
+  write((d) => d.messages.push({ id: newId(), role: "user", content: message, createdAt: Date.now() }));
+
+  let saved = null;
+  const fact = profile.memoryEnabled ? detectRememberIntent(message) : null;
+  if (fact) {
+    const mem = await extractMemory(fact, profile.userName);
+    saved = { id: newId(), ...mem, source: "chat", createdAt: Date.now() };
+    write((d) => d.memories.push(saved));
+    yield { type: "memory", memory: saved };
+  }
+
+  const system = buildSystemPrompt({ ...profile, memories: read().memories.slice(-MAX_MEMORIES_IN_PROMPT) });
+  const userTurn = saved ? `${message}\n\n[Sistema: memória guardada — ${saved.label}: ${saved.content}]` : message;
+
+  const stream = client.messages.stream(
+    { model: MODEL, max_tokens: 600, system, messages: [...history, { role: "user", content: userTurn }] },
+    { signal },
+  );
+
+  let reply = "";
+  for await (const ev of stream) {
+    if (ev.type === "content_block_delta" && ev.delta.type === "text_delta") {
+      reply += ev.delta.text;
+      yield { type: "delta", text: ev.delta.text };
+    }
+  }
+  if (reply.trim()) write((d) => d.messages.push({ id: newId(), role: "assistant", content: reply, createdAt: Date.now() }));
+  yield { type: "done" };
+}
